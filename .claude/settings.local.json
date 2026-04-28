@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('monitor_groups.py', encoding='utf-8'\\).read\\(\\)\\); print\\('SYNTAX OK'\\)\")",
+      "Bash(python -m py_compile monitor_groups.py)",
+      "Bash(python -c ' *)",
+      "Bash(powershell -NoProfile -Command \"Get-Process python -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime\")",
+      "Bash(python monitor_groups.py)",
+      "PowerShell(Stop-Process -Id 21976 -Force -ErrorAction SilentlyContinue)"
+    ]
+  }
+}
