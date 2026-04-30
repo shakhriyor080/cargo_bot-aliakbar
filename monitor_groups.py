@@ -36,8 +36,9 @@ SESSION_NAME = os.getenv("SESSION_NAME", "session")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Tashkent")
 SENT_CARGO_TTL_HOURS = int(os.getenv("SENT_CARGO_TTL_HOURS", "24"))
-SEARCH_CACHE_TTL_SECONDS = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "300"))
-SEARCH_MESSAGE_LIMIT = int(os.getenv("SEARCH_MESSAGE_LIMIT", "2000"))
+SEARCH_CACHE_TTL_SECONDS = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", "60"))
+SEARCH_MESSAGE_LIMIT = int(os.getenv("SEARCH_MESSAGE_LIMIT", "5000"))
+SEARCH_LOOKBACK_HOURS = int(os.getenv("SEARCH_LOOKBACK_HOURS", "18"))
 INITIAL_ADMIN_PASSWORD = os.getenv("INITIAL_ADMIN_PASSWORD", "123456")
 INITIAL_LOGISTICS_PASSWORD = os.getenv("INITIAL_LOGISTICS_PASSWORD", "password")
 DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "ru")
@@ -2107,10 +2108,10 @@ def invalidate_active_routes_cache():
 # ============================================================
 # TEXT HELPERS
 # ============================================================
-BLOCK_RE = re.compile(r"\n{2,}|━+|➖+|—{2,}|={2,}|\*{3,}")
-# Sequence of 3+ same non-word/non-space chars (with optional spaces between).
-# Catches separators like: 🔴🔴🔴, 🔴 🔴 🔴 🔴, 🟢🟢🟢, ▫▫▫, ......, ~~~~~ etc.
-SEPARATOR_RUN_RE = re.compile(r"([^\w\s])(?:\s*\1){2,}")
+BLOCK_RE = re.compile(r"\n{2,}|━+|➖+|—{2,}|={2,}|\*{3,}|═+|▬+|■+|▪{2,}|◆{2,}")
+# Sequence of 2+ same non-word/non-space chars (with optional spaces between).
+# Catches separators like: 🔴🔴, 🔴🔴🔴, 🔴 🔴 🔴, 🟢🟢, ▫▫▫, ......, ~~~~ etc.
+SEPARATOR_RUN_RE = re.compile(r"([^\w\s])(?:\s*\1){1,}")
 ARROW_RE = re.compile(r"\s*[➡➜→⇒⟶➤▶►⇨>]+\s*")
 DASH_SEP_RE = re.compile(r"\s+[-—–]\s+")
 PHONE_RE = re.compile(r"(?:\+|00)?\d[\d\s\-()]{7,16}\d")
@@ -4447,24 +4448,24 @@ async def catch_all(message: types.Message, state: FSMContext):
 # ============================================================
 # SEARCH (cached by route only — filters applied per-user post-search)
 # ============================================================
-async def _search_one_group(group: str, today, from_city: str, to_city: str, on_cargo=None):
+async def _search_one_group(group: str, cutoff, from_city: str, to_city: str, on_cargo=None):
     """Read a single group's messages, return matching cargos and optionally
-    invoke on_cargo for each one as it is found (streaming)."""
+    invoke on_cargo for each one as it is found (streaming).
+
+    cutoff is a timezone-aware datetime; messages older than cutoff stop the scan."""
     out = []
     try:
         title = db_get_group_title(group) or group
         async for msg in client.iter_messages(group, limit=SEARCH_MESSAGE_LIMIT):
             if not msg.text:
                 continue
-            msg_date = msg.date.astimezone(UZ_TIME).date()
-            if msg_date < today:
+            msg_dt = msg.date.astimezone(UZ_TIME)
+            if msg_dt < cutoff:
                 break
-            if msg_date > today:
-                continue
             blocks = split_blocks(msg.text)
             if not blocks:
                 continue
-            msg_time = msg.date.astimezone(UZ_TIME).strftime("%H:%M")
+            msg_time = msg_dt.strftime("%H:%M")
             for block in blocks:
                 if not match_route(block, from_city, to_city):
                     continue
@@ -4502,14 +4503,14 @@ async def search_cargos(from_city: str, to_city: str, on_cargo=None):
                     log.exception("on_cargo callback failed (cache)")
         return cached
 
-    today = datetime.now(UZ_TIME).date()
+    cutoff = datetime.now(UZ_TIME) - timedelta(hours=SEARCH_LOOKBACK_HOURS)
     groups = sorted(get_group_usernames_cached())
     if not groups:
         return []
 
     started = time.monotonic()
     group_results = await asyncio.gather(
-        *[_search_one_group(g, today, from_city, to_city, on_cargo) for g in groups],
+        *[_search_one_group(g, cutoff, from_city, to_city, on_cargo) for g in groups],
         return_exceptions=True,
     )
     elapsed = time.monotonic() - started
@@ -4519,7 +4520,8 @@ async def search_cargos(from_city: str, to_city: str, on_cargo=None):
         if isinstance(r, list):
             results.extend(r)
 
-    search_cache.set(cache_key, results)
+    if results:
+        search_cache.set(cache_key, results)
     log.info("Searched %s -> %s in %.2fs, %d cargos (parallel x%d)",
              from_city, to_city, elapsed, len(results), len(groups))
     return results
@@ -4558,6 +4560,10 @@ async def handle_new_message(event):
         blocks = split_blocks(event.raw_text)
         if not blocks:
             return
+
+        # New content arrived in a monitored group — drop stale search results
+        # so subsequent manual searches re-fetch and see this message.
+        search_cache.invalidate_all()
 
         title = db_get_group_title(chat_username_lc) or chat_username
         msg_time = event.message.date.astimezone(UZ_TIME).strftime("%H:%M")
