@@ -22,7 +22,6 @@ from aiogram.types import (
     KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
 )
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
 
 # ============================================================
 # CONFIG
@@ -30,8 +29,10 @@ from telethon import TelegramClient, events
 load_dotenv()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-API_ID = int(os.environ["TELEGRAM_API_ID"])
-API_HASH = os.environ["TELEGRAM_API_HASH"]
+# API_ID / API_HASH are no longer required (bot-only mode); kept optional
+# so existing .env files don't break.
+API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or "0")
+API_HASH = os.getenv("TELEGRAM_API_HASH", "")
 SESSION_NAME = os.getenv("SESSION_NAME", "session")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")
 TIMEZONE_NAME = os.getenv("TIMEZONE", "Asia/Tashkent")
@@ -1333,6 +1334,23 @@ def init_db():
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX IF NOT EXISTS idx_auto_routes_chat ON auto_routes(chat_id, enabled);
+        CREATE TABLE IF NOT EXISTS cargo_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_username TEXT NOT NULL,
+            group_title TEXT,
+            message_id INTEGER,
+            text TEXT NOT NULL,
+            posted_at TIMESTAMP NOT NULL,
+            sender_id INTEGER,
+            sender_name TEXT,
+            sender_username TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(group_username, message_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cargo_messages_recent
+            ON cargo_messages(posted_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_cargo_messages_group
+            ON cargo_messages(group_username, posted_at DESC);
         """)
 
         # Migrations for older DBs
@@ -1914,6 +1932,46 @@ def db_cleanup_sent():
         if cur.rowcount > 0:
             log.info("Cleaned %d expired sent_cargos", cur.rowcount)
 
+# ---------- local cargo message store (bot-only mode) ----------
+def db_store_cargo_message(group_username: str, group_title: str,
+                           message_id: int, text: str, posted_at,
+                           sender_id=None, sender_name=None, sender_username=None):
+    """Persist a group message so search can scan it later. Idempotent on
+    (group_username, message_id)."""
+    posted_str = posted_at.strftime("%Y-%m-%d %H:%M:%S") \
+        if hasattr(posted_at, "strftime") else str(posted_at)
+    with db() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO cargo_messages
+            (group_username, group_title, message_id, text, posted_at,
+             sender_id, sender_name, sender_username)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (group_username, group_title, message_id, text, posted_str,
+              sender_id, sender_name, sender_username))
+
+def db_iter_recent_messages(cutoff_dt):
+    """Yield messages newer than cutoff_dt across all monitored groups,
+    newest first."""
+    cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT group_username, group_title, message_id, text, posted_at,
+                   sender_id, sender_name, sender_username
+            FROM cargo_messages
+            WHERE posted_at >= ?
+            ORDER BY posted_at DESC
+        """, (cutoff_str,)).fetchall()
+    return rows
+
+def db_cleanup_cargo_messages(retention_hours: int = 48):
+    """Remove cargo messages older than retention_hours."""
+    cutoff = (datetime.now(UZ_TIME) - timedelta(hours=retention_hours)) \
+        .strftime("%Y-%m-%d %H:%M:%S")
+    with db() as conn:
+        cur = conn.execute("DELETE FROM cargo_messages WHERE posted_at < ?", (cutoff,))
+        if cur.rowcount > 0:
+            log.info("Cleaned %d old cargo_messages", cur.rowcount)
+
 # ---------- groups ----------
 def db_list_groups():
     with db() as conn:
@@ -1941,6 +1999,17 @@ def db_add_group(username: str, title: str, added_by: int) -> bool:
 def db_remove_group(username: str) -> bool:
     with db() as conn:
         cur = conn.execute("DELETE FROM groups WHERE username = ?", (username,))
+        return cur.rowcount > 0
+
+def db_update_group_title(username: str, title: str) -> bool:
+    """Update title only if currently empty / placeholder. Returns True if changed."""
+    if not title:
+        return False
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE groups SET title = ? WHERE username = ? AND (title IS NULL OR title = '' OR title = ?)",
+            (title, username, username),
+        )
         return cur.rowcount > 0
 
 # ---------- filters ----------
@@ -2370,6 +2439,13 @@ def extract_weight_range(text: str):
 def format_username(sender, lang: str) -> str:
     if sender is None:
         return t("unknown_user", lang)
+    # Plain string (bot-only mode stores sender_name/username as text)
+    if isinstance(sender, str):
+        s = sender.strip()
+        if not s:
+            return t("unknown_user", lang)
+        return s if s.startswith("@") else s
+    # Telethon entity (legacy path)
     if getattr(sender, "username", None):
         return f"@{sender.username}"
     if getattr(sender, "first_name", None):
@@ -2551,7 +2627,6 @@ search_cache = TTLCache(SEARCH_CACHE_TTL_SECONDS)
 # ============================================================
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 HTML_PARSE = "HTML"
 
 class AuthStates(StatesGroup):
@@ -3063,13 +3138,7 @@ async def cmd_addgroup(message: types.Message, command: CommandObject):
     if username in db_get_group_usernames():
         await message.answer(t("group_already", lang, name=f"@{username}"))
         return
-    try:
-        entity = await client.get_entity(username)
-        title = getattr(entity, "title", None) or username
-    except Exception as e:
-        log.warning("get_entity failed for %s: %s", username, e)
-        await message.answer(t("group_access_error", lang, name=f"@{username}", error=str(e)))
-        return
+    title = username  # title fills in the first time the bot sees a message there
     try:
         added = db_add_group(username, title, message.chat.id)
     except Exception:
@@ -3705,13 +3774,7 @@ async def form_add_group(message: types.Message, state: FSMContext):
         await message.answer(t("group_already", lang, name=f"@{username}"))
         await state.clear()
         return
-    try:
-        entity = await client.get_entity(username)
-        title = getattr(entity, "title", None) or username
-    except Exception as e:
-        await message.answer(t("group_access_error", lang, name=f"@{username}", error=str(e)))
-        await state.clear()
-        return
+    title = username  # filled in the first time the bot sees a message there
     db_add_group(username, title, chat_id)
     invalidate_groups_cache()
     search_cache.invalidate_all()
@@ -4446,54 +4509,11 @@ async def catch_all(message: types.Message, state: FSMContext):
     await do_route_search(chat_id, lang, text)
 
 # ============================================================
-# SEARCH (cached by route only — filters applied per-user post-search)
+# SEARCH — local SQLite store (bot-only mode, no Telethon required)
 # ============================================================
-async def _search_one_group(group: str, cutoff, from_city: str, to_city: str, on_cargo=None):
-    """Read a single group's messages, return matching cargos and optionally
-    invoke on_cargo for each one as it is found (streaming).
-
-    cutoff is a timezone-aware datetime; messages older than cutoff stop the scan."""
-    out = []
-    try:
-        title = db_get_group_title(group) or group
-        async for msg in client.iter_messages(group, limit=SEARCH_MESSAGE_LIMIT):
-            if not msg.text:
-                continue
-            msg_dt = msg.date.astimezone(UZ_TIME)
-            if msg_dt < cutoff:
-                break
-            blocks = split_blocks(msg.text)
-            if not blocks:
-                continue
-            msg_time = msg_dt.strftime("%H:%M")
-            for block in blocks:
-                if not match_route(block, from_city, to_city):
-                    continue
-                phone = extract_phone(block) or extract_phone(msg.text)
-                cargo = {
-                    "hash": cargo_hash(block),
-                    "block": block,
-                    "phone": phone,
-                    "sender": msg.sender,
-                    "source": title,
-                    "time": msg_time,
-                }
-                out.append(cargo)
-                if on_cargo:
-                    try:
-                        await on_cargo(cargo)
-                    except Exception:
-                        log.exception("on_cargo callback failed")
-    except Exception as exc:
-        # Log just the error type + message at WARNING (no full traceback noise),
-        # so per-group issues like "not a member" are easy to scan.
-        log.warning("Failed to read group '%s': %s: %s",
-                    group, type(exc).__name__, exc)
-    return out
-
 async def search_cargos(from_city: str, to_city: str, on_cargo=None):
-    """If on_cargo is provided, results are streamed via the callback as they
-    are found in any group (parallel). Returns the full result list at the end."""
+    """Scan locally-stored group messages for cargos matching the route.
+    If on_cargo is provided, results are streamed via the callback."""
     cache_key = (normalize_text(from_city), normalize_text(to_city))
     cached = search_cache.get(cache_key)
     if cached is not None:
@@ -4507,26 +4527,57 @@ async def search_cargos(from_city: str, to_city: str, on_cargo=None):
         return cached
 
     cutoff = datetime.now(UZ_TIME) - timedelta(hours=SEARCH_LOOKBACK_HOURS)
-    groups = sorted(get_group_usernames_cached())
-    if not groups:
+    monitored_groups = get_group_usernames_cached()
+    if not monitored_groups:
         return []
 
     started = time.monotonic()
-    group_results = await asyncio.gather(
-        *[_search_one_group(g, cutoff, from_city, to_city, on_cargo) for g in groups],
-        return_exceptions=True,
-    )
-    elapsed = time.monotonic() - started
+    rows = await asyncio.to_thread(db_iter_recent_messages, cutoff)
 
     results = []
-    for r in group_results:
-        if isinstance(r, list):
-            results.extend(r)
+    for row in rows:
+        group_username = row["group_username"]
+        if group_username not in monitored_groups:
+            continue
+        text = row["text"] or ""
+        if not text:
+            continue
+        title = row["group_title"] or group_username
+        try:
+            posted_dt = datetime.strptime(row["posted_at"], "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            posted_dt = datetime.now(UZ_TIME)
+        msg_time = posted_dt.strftime("%H:%M")
+
+        blocks = split_blocks(text)
+        if not blocks:
+            continue
+        for block in blocks:
+            if not match_route(block, from_city, to_city):
+                continue
+            phone = extract_phone(block) or extract_phone(text)
+            sender_name = row["sender_name"] or row["sender_username"]
+            cargo = {
+                "hash": cargo_hash(block),
+                "block": block,
+                "phone": phone,
+                "sender": sender_name,
+                "source": title,
+                "time": msg_time,
+            }
+            results.append(cargo)
+            if on_cargo:
+                try:
+                    await on_cargo(cargo)
+                except Exception:
+                    log.exception("on_cargo callback failed")
+
+    elapsed = time.monotonic() - started
 
     if results:
         search_cache.set(cache_key, results)
-    log.info("Searched %s -> %s in %.2fs, %d cargos (parallel x%d)",
-             from_city, to_city, elapsed, len(results), len(groups))
+    log.info("Searched %s -> %s in %.2fs, %d cargos (local DB, %d groups)",
+             from_city, to_city, elapsed, len(results), len(monitored_groups))
     return results
 
 def format_cargo(cargo: dict, is_new: bool, lang: str) -> str:
@@ -4542,17 +4593,19 @@ def format_cargo(cargo: dict, is_new: bool, lang: str) -> str:
     )
 
 # ============================================================
-# LIVE TELETHON HANDLER
+# LIVE GROUP HANDLER (aiogram bot, no Telethon needed)
 # ============================================================
-@client.on(events.NewMessage())
-async def handle_new_message(event):
+# Bot must be a member of cargo groups with privacy mode DISABLED in
+# @BotFather (/mybots → bot → Bot Settings → Group Privacy → Turn off)
+# so it sees every message, not just commands.
+@dp.message(F.chat.type.in_({"group", "supergroup", "channel"}))
+async def handle_group_message(message: types.Message):
     try:
-        if not event.raw_text:
-            return
-        if not (event.is_group or event.is_channel):
+        text = message.text or message.caption or ""
+        if not text:
             return
 
-        chat = event.chat
+        chat = message.chat
         chat_username = getattr(chat, "username", None)
         if not chat_username:
             return
@@ -4560,16 +4613,42 @@ async def handle_new_message(event):
         if chat_username_lc not in get_group_usernames_cached():
             return
 
-        blocks = split_blocks(event.raw_text)
+        title = db_get_group_title(chat_username_lc) or (chat.title or chat_username)
+        # First time we see this group's real title — persist it
+        if chat.title and (title == chat_username_lc or title == chat_username):
+            try:
+                if db_update_group_title(chat_username_lc, chat.title):
+                    invalidate_groups_cache()
+                    title = chat.title
+            except Exception:
+                log.exception("Failed to update group title")
+        posted_at = message.date.astimezone(UZ_TIME) if message.date else datetime.now(UZ_TIME)
+
+        sender = message.from_user
+        sender_id = sender.id if sender else None
+        sender_name = (sender.full_name if sender else None) or (chat.title if chat else None)
+        sender_username = sender.username if sender else None
+
+        # Persist for future searches
+        try:
+            await asyncio.to_thread(
+                db_store_cargo_message,
+                chat_username_lc, title, message.message_id, text, posted_at,
+                sender_id, sender_name, sender_username,
+            )
+        except Exception:
+            log.exception("Failed to persist cargo message")
+
+        blocks = split_blocks(text)
         if not blocks:
             return
 
-        # New content arrived in a monitored group — drop stale search results
-        # so subsequent manual searches re-fetch and see this message.
+        # Fresh content arrived — drop stale search results.
         search_cache.invalidate_all()
 
-        title = db_get_group_title(chat_username_lc) or chat_username
-        msg_time = event.message.date.astimezone(UZ_TIME).strftime("%H:%M")
+        msg_time = posted_at.strftime("%H:%M")
+        sender_display = (f"@{sender_username}" if sender_username
+                          else (sender_name or ""))
 
         try:
             routes = get_active_routes_cached()
@@ -4583,7 +4662,7 @@ async def handle_new_message(event):
             for block in blocks:
                 if not match_route(block, from_city, to_city):
                     continue
-                phone = extract_phone(block) or extract_phone(event.raw_text)
+                phone = extract_phone(block) or extract_phone(text)
                 if not cargo_passes_filters(block, phone, filters):
                     continue
                 ch = cargo_hash(block)
@@ -4594,7 +4673,7 @@ async def handle_new_message(event):
                         "hash": ch,
                         "block": block,
                         "phone": phone,
-                        "sender": event.sender,
+                        "sender": sender_display,
                         "source": title,
                         "time": msg_time,
                     }
@@ -4613,6 +4692,7 @@ async def periodic_cleanup():
     while True:
         try:
             db_cleanup_sent()
+            db_cleanup_cargo_messages(retention_hours=max(SEARCH_LOOKBACK_HOURS * 2, 48))
             search_cache.cleanup()
         except Exception:
             log.exception("Periodic cleanup failed")
@@ -4623,30 +4703,13 @@ async def periodic_cleanup():
 # ============================================================
 async def main():
     init_db()
-    await client.start()
-
-    # Sanity-check: cargo search uses GetHistoryRequest, which is forbidden
-    # for bot accounts. Fail loudly here instead of throwing on every search.
-    try:
-        me = await client.get_me()
-    except Exception:
-        log.exception("Failed to fetch own user info from Telethon")
-        raise
-    if getattr(me, "bot", False):
-        log.error(
-            "Telethon session is a BOT account (@%s). Group history cannot be read. "
-            "Delete %s.session and run create_session.py with a phone number to "
-            "create a USER session.",
-            getattr(me, "username", "?"), SESSION_NAME,
-        )
-        raise SystemExit(
-            "Telethon session is a bot account; need a user-account session. "
-            "Run: rm session.session && python create_session.py"
-        )
     log.info(
-        "Telethon connected as USER %s (@%s) id=%s; %d groups configured",
-        getattr(me, "first_name", "?"), getattr(me, "username", "?"),
-        getattr(me, "id", "?"), len(db_get_group_usernames()),
+        "Bot starting (aiogram-only mode); %d groups configured",
+        len(db_get_group_usernames()),
+    )
+    log.info(
+        "Reminder: bot must be a MEMBER of every cargo group with privacy "
+        "mode DISABLED in @BotFather (Bot Settings -> Group Privacy -> Turn off)."
     )
 
     cleanup_task = asyncio.create_task(periodic_cleanup())
@@ -4663,10 +4726,6 @@ async def main():
             await bot.session.close()
         except Exception:
             log.exception("Failed to close bot session")
-        try:
-            await client.disconnect()
-        except Exception:
-            log.exception("Failed to disconnect telethon")
         log.info("Bot stopped")
 
 if __name__ == "__main__":
