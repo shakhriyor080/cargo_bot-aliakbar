@@ -4484,8 +4484,11 @@ async def _search_one_group(group: str, cutoff, from_city: str, to_city: str, on
                         await on_cargo(cargo)
                     except Exception:
                         log.exception("on_cargo callback failed")
-    except Exception:
-        log.exception("Failed to read group '%s'", group)
+    except Exception as exc:
+        # Log just the error type + message at WARNING (no full traceback noise),
+        # so per-group issues like "not a member" are easy to scan.
+        log.warning("Failed to read group '%s': %s: %s",
+                    group, type(exc).__name__, exc)
     return out
 
 async def search_cargos(from_city: str, to_city: str, on_cargo=None):
@@ -4621,7 +4624,30 @@ async def periodic_cleanup():
 async def main():
     init_db()
     await client.start()
-    log.info("Telethon connected; %d groups configured", len(db_get_group_usernames()))
+
+    # Sanity-check: cargo search uses GetHistoryRequest, which is forbidden
+    # for bot accounts. Fail loudly here instead of throwing on every search.
+    try:
+        me = await client.get_me()
+    except Exception:
+        log.exception("Failed to fetch own user info from Telethon")
+        raise
+    if getattr(me, "bot", False):
+        log.error(
+            "Telethon session is a BOT account (@%s). Group history cannot be read. "
+            "Delete %s.session and run create_session.py with a phone number to "
+            "create a USER session.",
+            getattr(me, "username", "?"), SESSION_NAME,
+        )
+        raise SystemExit(
+            "Telethon session is a bot account; need a user-account session. "
+            "Run: rm session.session && python create_session.py"
+        )
+    log.info(
+        "Telethon connected as USER %s (@%s) id=%s; %d groups configured",
+        getattr(me, "first_name", "?"), getattr(me, "username", "?"),
+        getattr(me, "id", "?"), len(db_get_group_usernames()),
+    )
 
     cleanup_task = asyncio.create_task(periodic_cleanup())
     try:
