@@ -50,27 +50,51 @@ if client.is_user_authorized():
     client.disconnect()
     sys.exit(0)
 
-# Send the code (Telegram chooses delivery: app message first, SMS as fallback)
+# First request: Telegram delivers via the Telegram app (SentCodeTypeApp).
+# WARNING: opening the Telegram chat that contains the code invalidates it.
 sent = client.send_code_request(phone)
-print(f"Code sent. Type: {sent.type.__class__.__name__}")
+print(f"Code sent via: {sent.type.__class__.__name__}")
+print()
+print("Choose delivery method:")
+print("  [1] Use code from Telegram app (do NOT open the chat)")
+print("  [2] Resend code as SMS (recommended)")
+choice = input("Choice [1/2]: ").strip()
+if choice == "2":
+    sent = client.send_code_request(phone, force_sms=True)
+    print(f"Code resent via: {sent.type.__class__.__name__}")
 print()
 
-# Allow up to 5 attempts before requesting a fresh code
+# Allow up to 5 attempts before giving up
+signed_in = False
 for attempt in range(1, 6):
     code = input(f"[{attempt}/5] Enter code: ").strip().replace(" ", "")
+    if not code:
+        print("  -> empty input, try again")
+        continue
     try:
         client.sign_in(phone=phone, code=code)
+        signed_in = True
         break
     except PhoneCodeInvalidError:
-        print("  -> Invalid code, try again (or press Ctrl+C to abort).")
+        print("  -> Invalid code (wrong digits). Try again.")
     except PhoneCodeExpiredError:
-        print("  -> Code expired. Requesting a new one...")
-        sent = client.send_code_request(phone)
+        print("  -> Code expired (already invalidated, e.g. by opening the chat).")
+        resend = input("     Resend? [s=SMS / a=app / n=abort]: ").strip().lower()
+        if resend == "n":
+            break
+        try:
+            sent = client.send_code_request(phone, force_sms=(resend == "s"))
+            print(f"     New code sent via: {sent.type.__class__.__name__}")
+        except Exception as exc:
+            print(f"     Resend failed: {exc}")
+            break
     except SessionPasswordNeededError:
         password = input("2FA password: ")
         client.sign_in(password=password)
+        signed_in = True
         break
-else:
+
+if not signed_in:
     print("Too many failed attempts. Aborting.")
     client.disconnect()
     sys.exit(1)
